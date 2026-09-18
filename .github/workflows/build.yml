@@ -352,6 +352,7 @@ jobs:
               val openFolderId: String? = null,
               val suggestions: List<Suggestion> = emptyList(),
               val showNewFolderDialog: Boolean = false,
+              val showManageFolders: Boolean = false,
               val query: String = "",
               val message: String? = null
           ) {
@@ -515,6 +516,30 @@ jobs:
                   // Non utilise en v1 : les dossiers ne se regroupent pas entre eux.
               }
 
+              fun openManageFolders() { _state.value = _state.value.copy(showManageFolders = true) }
+              fun closeManageFolders() { _state.value = _state.value.copy(showManageFolders = false) }
+
+              fun moveAppToFolder(appKey: String, targetFolderId: String?) {
+                  var sourceFolderId: String? = null
+                  layout.folders.forEach { (id, f) -> if (appKey in f.apps) sourceFolderId = id }
+                  if (sourceFolderId != null) {
+                      layout.folders[sourceFolderId]?.apps?.remove(appKey)
+                  } else {
+                      layout.order.remove(appKey)
+                  }
+                  if (targetFolderId == null) {
+                      if (appKey !in layout.order) layout.order.add(appKey)
+                  } else {
+                      val f = layout.folders[targetFolderId]
+                      if (f != null && appKey !in f.apps) f.apps.add(appKey)
+                  }
+                  val emptied = sourceFolderId
+                  if (emptied != null && layout.folders[emptied]?.apps?.isEmpty() == true) {
+                      deleteFolderInternal(emptied)
+                  }
+                  persist()
+              }
+
               private fun handleReorderTap(id: String) {
                   val current = _state.value.moveModeId
                   when {
@@ -595,7 +620,10 @@ jobs:
           import androidx.compose.foundation.Image
           import androidx.compose.foundation.background
           import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
           import androidx.compose.foundation.combinedClickable
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.lazy.grid.GridCells
           import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -661,7 +689,18 @@ jobs:
                               Text("Quart Home", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
                               Text(state.allApps.size.toString() + " applications", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
                           }
+                          TextButton(onClick = {
+                              runCatching {
+                                  context.startActivity(Intent(Settings.ACTION_HOME_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                              }
+                          }) { Text("Quitter", color = Color.White) }
+                      }
+
+                      Spacer(Modifier.height(4.dp))
+
+                      Row {
                           TextButton(onClick = { vm.computeSuggestions() }) { Text("Optimiser", color = Color.White) }
+                          TextButton(onClick = { vm.openManageFolders() }) { Text("Dossiers", color = Color.White) }
                           TextButton(onClick = { vm.toggleReorderMode() }) {
                               Text(if (state.reorderMode) "Termine" else "Deplacer", color = if (state.reorderMode) Violet else Color.White)
                           }
@@ -771,6 +810,17 @@ jobs:
                       onAccept = { vm.acceptSuggestion(it) },
                       onDismissOne = { vm.dismissSuggestion(it) },
                       onClose = { vm.clearSuggestions() }
+                  )
+              }
+
+              if (state.showManageFolders) {
+                  val homeApps = state.order.filterNot { it.startsWith("folder:") }.mapNotNull { state.appsByKey[it] }
+                  ManageFoldersDialog(
+                      folders = state.folders,
+                      homeApps = homeApps,
+                      appsByKey = state.appsByKey,
+                      onMove = { key, target -> vm.moveAppToFolder(key, target) },
+                      onDismiss = { vm.closeManageFolders() }
                   )
               }
           }
@@ -1030,6 +1080,110 @@ jobs:
                       Spacer(Modifier.height(10.dp))
                       Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                           TextButton(onClick = onClose) { Text("Fermer", color = Color.White) }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun ManageFoldersDialog(
+              folders: Map<String, FolderData>,
+              homeApps: List<AppEntry>,
+              appsByKey: Map<String, AppEntry>,
+              onMove: (String, String?) -> Unit,
+              onDismiss: () -> Unit
+          ) {
+              var movingApp by remember { mutableStateOf<AppEntry?>(null) }
+
+              Dialog(onDismissRequest = onDismiss) {
+                  Column(
+                      Modifier.clip(RoundedCornerShape(20.dp)).background(Color(0xFF1A1A2E))
+                          .heightIn(max = 560.dp).padding(20.dp)
+                  ) {
+                      Text("Gerer les dossiers", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                      Spacer(Modifier.height(4.dp))
+                      Text("Touchez une application pour la deplacer", color = Color.White.copy(alpha = 0.5f), fontSize = 11.sp)
+                      Spacer(Modifier.height(12.dp))
+
+                      Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
+                          folders.forEach { (id, f) ->
+                              Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 10.dp, bottom = 4.dp)) {
+                                  Box(Modifier.size(12.dp).clip(CircleShape).background(Color(f.color)))
+                                  Spacer(Modifier.width(8.dp))
+                                  Text(f.name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                              }
+                              f.apps.mapNotNull { appsByKey[it] }.forEach { app ->
+                                  ManageAppRow(app) { movingApp = app }
+                              }
+                          }
+                          Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 14.dp, bottom = 4.dp)) {
+                              Text("Ecran d'accueil", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                          }
+                          homeApps.forEach { app -> ManageAppRow(app) { movingApp = app } }
+                      }
+
+                      Spacer(Modifier.height(12.dp))
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                          TextButton(onClick = onDismiss) { Text("Fermer", color = Color.White) }
+                      }
+                  }
+              }
+
+              val app = movingApp
+              if (app != null) {
+                  MoveAppDialog(
+                      appLabel = app.label,
+                      folders = folders,
+                      onPick = { target -> onMove(app.key, target); movingApp = null },
+                      onDismiss = { movingApp = null }
+                  )
+              }
+          }
+
+          @Composable
+          private fun ManageAppRow(app: AppEntry, onClick: () -> Unit) {
+              Row(
+                  Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                      .clickable { onClick() }
+                      .padding(vertical = 8.dp, horizontal = 4.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  if (app.icon != null) Image(bitmap = app.icon, contentDescription = null, modifier = Modifier.size(28.dp))
+                  else Box(Modifier.size(28.dp).clip(RoundedCornerShape(8.dp)).background(Color.White.copy(alpha = 0.2f)))
+                  Spacer(Modifier.width(10.dp))
+                  Text(app.label, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+              }
+          }
+
+          @Composable
+          private fun MoveAppDialog(
+              appLabel: String,
+              folders: Map<String, FolderData>,
+              onPick: (String?) -> Unit,
+              onDismiss: () -> Unit
+          ) {
+              Dialog(onDismissRequest = onDismiss) {
+                  Column(
+                      Modifier.clip(RoundedCornerShape(20.dp)).background(Color(0xFF1A1A2E)).padding(20.dp)
+                  ) {
+                      Text("Deplacer " + appLabel, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                      Spacer(Modifier.height(12.dp))
+                      Row(
+                          Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable { onPick(null) }.padding(vertical = 10.dp)
+                      ) { Text("Ecran d'accueil", color = Color.White) }
+                      folders.forEach { (id, f) ->
+                          Row(
+                              Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable { onPick(id) }.padding(vertical = 10.dp),
+                              verticalAlignment = Alignment.CenterVertically
+                          ) {
+                              Box(Modifier.size(14.dp).clip(CircleShape).background(Color(f.color)))
+                              Spacer(Modifier.width(8.dp))
+                              Text(f.name, color = Color.White)
+                          }
+                      }
+                      Spacer(Modifier.height(10.dp))
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                          TextButton(onClick = onDismiss) { Text("Annuler", color = Color.White.copy(alpha = 0.7f)) }
                       }
                   }
               }
