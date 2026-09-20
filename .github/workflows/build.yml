@@ -94,6 +94,9 @@ jobs:
           cat > app/src/main/AndroidManifest.xml <<'XML'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.SET_WALLPAPER" />
+
               <queries>
                   <intent>
                       <action android:name="android.intent.action.MAIN" />
@@ -323,6 +326,105 @@ jobs:
           }
           KT
 
+          cat > $D/SettingsStore.kt <<'KT'
+          package com.quart.home
+          import android.content.Context
+
+          class SettingsStore(context: Context) {
+              private val prefs = context.getSharedPreferences("quart_settings", Context.MODE_PRIVATE)
+
+              var nanoBananaApiKey: String
+                  get() = prefs.getString(KEY_API, "") ?: ""
+                  set(value) { prefs.edit().putString(KEY_API, value).apply() }
+
+              companion object {
+                  private const val KEY_API = "nano_banana_api_key"
+              }
+          }
+          KT
+
+          cat > $D/NanoBananaClient.kt <<'KT'
+          package com.quart.home
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.withContext
+          import org.json.JSONObject
+          import java.io.BufferedOutputStream
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          class NanoBananaException(message: String) : Exception(message)
+
+          private const val BASE_URL = "https://runapi.ai"
+          private const val TEXT_TO_IMAGE_PATH = "/api/v1/nano_banana/text_to_image"
+          private const val POLL_INTERVAL_MS = 2000L
+          private const val MAX_WAIT_MS = 5 * 60 * 1000L
+
+          class NanoBananaClient(private val apiKey: String) {
+
+              suspend fun generateImageUrl(prompt: String, aspectRatio: String): String = withContext(Dispatchers.IO) {
+                  val body = JSONObject().apply {
+                      put("prompt", prompt)
+                      put("aspect_ratio", aspectRatio)
+                  }
+                  val taskId = create(body)
+                  pollUntilComplete(taskId)
+              }
+
+              private fun create(body: JSONObject): String {
+                  val connection = openConnection(TEXT_TO_IMAGE_PATH, "POST")
+                  connection.doOutput = true
+                  BufferedOutputStream(connection.outputStream).use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                  val json = readJson(connection)
+                  return json.optString("id").takeIf { it.isNotBlank() }
+                      ?: throw NanoBananaException("Reponse invalide : identifiant de tache manquant.")
+              }
+
+              private suspend fun pollUntilComplete(taskId: String): String {
+                  val deadline = System.currentTimeMillis() + MAX_WAIT_MS
+                  while (System.currentTimeMillis() < deadline) {
+                      val connection = openConnection("$TEXT_TO_IMAGE_PATH/$taskId", "GET")
+                      val json = readJson(connection)
+                      when (json.optString("status").lowercase()) {
+                          "completed", "success" -> {
+                              val images = json.optJSONArray("images")
+                              val url = if (images != null && images.length() > 0) images.getJSONObject(0).optString("url") else null
+                              return url?.takeIf { it.isNotBlank() } ?: throw NanoBananaException("Aucune image renvoyee par le serveur.")
+                          }
+                          "failed", "error" -> {
+                              val message = json.optString("error").takeIf { it.isNotBlank() } ?: "La generation a echoue."
+                              throw NanoBananaException(message)
+                          }
+                      }
+                      delay(POLL_INTERVAL_MS)
+                  }
+                  throw NanoBananaException("Delai de generation depasse.")
+              }
+
+              private fun openConnection(path: String, method: String): HttpURLConnection {
+                  val connection = URL(BASE_URL + path).openConnection() as HttpURLConnection
+                  connection.requestMethod = method
+                  connection.setRequestProperty("Authorization", "Bearer " + apiKey)
+                  connection.setRequestProperty("Accept", "application/json")
+                  if (method == "POST") connection.setRequestProperty("Content-Type", "application/json")
+                  connection.connectTimeout = 20000
+                  connection.readTimeout = 20000
+                  return connection
+              }
+
+              private fun readJson(connection: HttpURLConnection): JSONObject {
+                  val code = connection.responseCode
+                  val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+                  val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+                  if (code !in 200..299) {
+                      val message = runCatching { JSONObject(text).optJSONObject("error")?.optString("message") }.getOrNull()
+                      throw NanoBananaException(message?.takeIf { it.isNotBlank() } ?: "Erreur serveur ($code).")
+                  }
+                  return JSONObject(text)
+              }
+          }
+          KT
+
       - name: Create view model
         run: |
           D=app/src/main/java/com/quart/home
@@ -330,12 +432,22 @@ jobs:
           cat > $D/HomeViewModel.kt <<'KT'
           package com.quart.home
           import android.app.Application
+          import android.app.WallpaperManager
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.compose.ui.graphics.asAndroidBitmap
+          import androidx.compose.ui.graphics.asImageBitmap
           import androidx.lifecycle.AndroidViewModel
           import androidx.lifecycle.viewModelScope
+          import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.flow.MutableStateFlow
           import kotlinx.coroutines.flow.StateFlow
           import kotlinx.coroutines.flow.asStateFlow
           import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.net.HttpURLConnection
+          import java.net.URL
           import java.util.UUID
 
           private val FOLDER_PALETTE = listOf(0xFF5B4DFFL, 0xFFFF6B6BL, 0xFFFFA94DL, 0xFF20C997L, 0xFF339AF0L, 0xFFCC5DE8L)
@@ -353,6 +465,11 @@ jobs:
               val suggestions: List<Suggestion> = emptyList(),
               val showNewFolderDialog: Boolean = false,
               val showManageFolders: Boolean = false,
+              val showAiImageDialog: Boolean = false,
+              val apiKey: String = "",
+              val aiImageLoading: Boolean = false,
+              val aiImageError: String? = null,
+              val aiImageBitmap: ImageBitmap? = null,
               val query: String = "",
               val message: String? = null
           ) {
@@ -376,6 +493,7 @@ jobs:
           class HomeViewModel(app: Application) : AndroidViewModel(app) {
               private val repo = AppRepository(app)
               private val store = LayoutStore(app)
+              private val settings = SettingsStore(app)
               private var layout = LayoutData()
 
               private val _state = MutableStateFlow(HomeUiState())
@@ -597,6 +715,64 @@ jobs:
 
               fun clearSuggestions() { _state.value = _state.value.copy(suggestions = emptyList()) }
 
+              fun openAiImageDialog() {
+                  _state.value = _state.value.copy(
+                      showAiImageDialog = true,
+                      apiKey = settings.nanoBananaApiKey,
+                      aiImageError = null,
+                      aiImageBitmap = null
+                  )
+              }
+
+              fun closeAiImageDialog() {
+                  _state.value = _state.value.copy(showAiImageDialog = false, aiImageLoading = false)
+              }
+
+              fun onApiKeyChange(value: String) { _state.value = _state.value.copy(apiKey = value) }
+
+              fun generateAiImage(prompt: String, aspectRatio: String) {
+                  if (prompt.isBlank()) return
+                  val key = _state.value.apiKey.trim()
+                  if (key.isBlank()) {
+                      _state.value = _state.value.copy(aiImageError = "Entrez votre cle API runapi.ai.")
+                      return
+                  }
+                  settings.nanoBananaApiKey = key
+                  _state.value = _state.value.copy(aiImageLoading = true, aiImageError = null, aiImageBitmap = null)
+                  viewModelScope.launch {
+                      val result = runCatching {
+                          val url = NanoBananaClient(key).generateImageUrl(prompt.trim(), aspectRatio)
+                          downloadBitmap(url)
+                      }
+                      result.onSuccess { bitmap ->
+                          _state.value = _state.value.copy(aiImageLoading = false, aiImageBitmap = bitmap.asImageBitmap())
+                      }.onFailure { error ->
+                          _state.value = _state.value.copy(aiImageLoading = false, aiImageError = error.message ?: "Erreur inconnue.")
+                      }
+                  }
+              }
+
+              fun setAiImageAsWallpaper() {
+                  val bitmap = _state.value.aiImageBitmap ?: return
+                  runCatching {
+                      WallpaperManager.getInstance(getApplication()).setBitmap(bitmap.asAndroidBitmap())
+                  }.onSuccess {
+                      showMessage("Fond d'ecran mis a jour.")
+                      closeAiImageDialog()
+                  }.onFailure {
+                      showMessage("Impossible de definir le fond d'ecran.")
+                  }
+              }
+
+              private suspend fun downloadBitmap(url: String): Bitmap = withContext(Dispatchers.IO) {
+                  val connection = URL(url).openConnection() as HttpURLConnection
+                  connection.connectTimeout = 20000
+                  connection.readTimeout = 20000
+                  connection.inputStream.use { stream ->
+                      BitmapFactory.decodeStream(stream) ?: throw NanoBananaException("Image invalide recue du serveur.")
+                  }
+              }
+
               fun consumeMessage() { _state.value = _state.value.copy(message = null) }
               private fun showMessage(text: String) { _state.value = _state.value.copy(message = text) }
           }
@@ -638,6 +814,7 @@ jobs:
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.input.PasswordVisualTransformation
           import androidx.compose.ui.text.style.TextAlign
           import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.dp
@@ -704,6 +881,7 @@ jobs:
                           TextButton(onClick = { vm.toggleReorderMode() }) {
                               Text(if (state.reorderMode) "Termine" else "Deplacer", color = if (state.reorderMode) Violet else Color.White)
                           }
+                          TextButton(onClick = { vm.openAiImageDialog() }) { Text("Image IA", color = Color.White) }
                       }
 
                       Spacer(Modifier.height(10.dp))
@@ -821,6 +999,19 @@ jobs:
                       appsByKey = state.appsByKey,
                       onMove = { key, target -> vm.moveAppToFolder(key, target) },
                       onDismiss = { vm.closeManageFolders() }
+                  )
+              }
+
+              if (state.showAiImageDialog) {
+                  AiImageDialog(
+                      apiKey = state.apiKey,
+                      loading = state.aiImageLoading,
+                      error = state.aiImageError,
+                      resultBitmap = state.aiImageBitmap,
+                      onApiKeyChange = { vm.onApiKeyChange(it) },
+                      onGenerate = { prompt, aspectRatio -> vm.generateAiImage(prompt, aspectRatio) },
+                      onSetWallpaper = { vm.setAiImageAsWallpaper() },
+                      onDismiss = { vm.closeAiImageDialog() }
                   )
               }
           }
@@ -1184,6 +1375,98 @@ jobs:
                       Spacer(Modifier.height(10.dp))
                       Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                           TextButton(onClick = onDismiss) { Text("Annuler", color = Color.White.copy(alpha = 0.7f)) }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun AiImageDialog(
+              apiKey: String,
+              loading: Boolean,
+              error: String?,
+              resultBitmap: ImageBitmap?,
+              onApiKeyChange: (String) -> Unit,
+              onGenerate: (String, String) -> Unit,
+              onSetWallpaper: () -> Unit,
+              onDismiss: () -> Unit
+          ) {
+              var prompt by remember { mutableStateOf("") }
+              var aspectRatio by remember { mutableStateOf("9:16") }
+              val ratios = listOf("9:16" to "Portrait", "1:1" to "Carre", "16:9" to "Paysage")
+
+              Dialog(onDismissRequest = onDismiss) {
+                  Column(
+                      Modifier.clip(RoundedCornerShape(20.dp)).background(Color(0xFF1A1A2E))
+                          .heightIn(max = 620.dp).verticalScroll(rememberScrollState()).padding(20.dp)
+                  ) {
+                      Text("Image IA", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                      Spacer(Modifier.height(4.dp))
+                      Text(
+                          "Genere une image avec Nano Banana (runapi.ai) et l'utilise comme fond d'ecran.",
+                          color = Color.White.copy(alpha = 0.5f), fontSize = 11.sp
+                      )
+                      Spacer(Modifier.height(12.dp))
+
+                      TextField(
+                          value = apiKey,
+                          onValueChange = onApiKeyChange,
+                          placeholder = { Text("Cle API runapi.ai") },
+                          singleLine = true,
+                          visualTransformation = PasswordVisualTransformation(),
+                          modifier = Modifier.fillMaxWidth()
+                      )
+                      Spacer(Modifier.height(10.dp))
+                      TextField(
+                          value = prompt,
+                          onValueChange = { prompt = it },
+                          placeholder = { Text("Decrivez l'image souhaitee") },
+                          modifier = Modifier.fillMaxWidth().heightIn(min = 72.dp)
+                      )
+                      Spacer(Modifier.height(10.dp))
+                      Row {
+                          ratios.forEach { (value, label) ->
+                              val selected = aspectRatio == value
+                              TextButton(onClick = { aspectRatio = value }) {
+                                  Text(label, color = if (selected) Violet else Color.White.copy(alpha = 0.6f))
+                              }
+                          }
+                      }
+                      Spacer(Modifier.height(8.dp))
+
+                      if (error != null) {
+                          Text(error, color = Color(0xFFFF6B6B), fontSize = 12.sp)
+                          Spacer(Modifier.height(8.dp))
+                      }
+
+                      if (loading) {
+                          Box(Modifier.fillMaxWidth().padding(vertical = 16.dp), contentAlignment = Alignment.Center) {
+                              CircularProgressIndicator(color = Violet)
+                          }
+                      }
+
+                      if (resultBitmap != null) {
+                          Image(
+                              bitmap = resultBitmap,
+                              contentDescription = null,
+                              modifier = Modifier.fillMaxWidth().heightIn(max = 260.dp).clip(RoundedCornerShape(12.dp))
+                          )
+                          Spacer(Modifier.height(10.dp))
+                          Button(
+                              onClick = onSetWallpaper,
+                              colors = ButtonDefaults.buttonColors(containerColor = Violet),
+                              modifier = Modifier.fillMaxWidth()
+                          ) { Text("Definir comme fond d'ecran") }
+                          Spacer(Modifier.height(8.dp))
+                      }
+
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                          TextButton(onClick = onDismiss) { Text("Fermer", color = Color.White.copy(alpha = 0.7f)) }
+                          Spacer(Modifier.width(8.dp))
+                          Button(
+                              onClick = { if (!loading) onGenerate(prompt, aspectRatio) },
+                              colors = ButtonDefaults.buttonColors(containerColor = Violet)
+                          ) { Text(if (resultBitmap == null) "Generer" else "Regenerer") }
                       }
                   }
               }
